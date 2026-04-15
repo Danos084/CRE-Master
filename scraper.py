@@ -2,6 +2,9 @@
 Bayside Commercial Listings Scraper
 Scrapes commercialrealestate.com.au for lease listings
 across the Bayside / Logan corridor in Queensland.
+
+URL format confirmed: https://www.commercialrealestate.com.au/for-lease/{stringId}/
+Selectors confirmed via live DOM inspection.
 """
 
 import json
@@ -15,44 +18,41 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Target suburbs with correct postcodes ─────────────────────────────────────
+# ── Suburbs with confirmed CRE stringIds ─────────────────────────────────────
+# stringIds sourced from the /bf/api/suggestions endpoint
 SUBURBS = [
-    # Eastern Bayside corridor
-    ("Morningside",     "4170"),
-    ("Murarrie",        "4172"),
-    ("Tingalpa",        "4173"),
-    ("Wynnum",          "4178"),
-    ("Manly",           "4179"),
-    ("Birkdale",        "4159"),
-    ("Wellington Point","4160"),
-    ("Ormiston",        "4160"),
-    ("Cleveland",       "4163"),
-    ("Alexandra Hills", "4161"),
-    ("Capalaba",        "4157"),
-    ("Redland Bay",     "4165"),
-    ("Victoria Point",  "4165"),
-    # Southern Logan corridor
-    ("Loganholme",      "4129"),
-    ("Shailer Park",    "4128"),
-    ("Tanah Merah",     "4128"),
-    ("Springwood",      "4127"),
-    ("Daisy Hill",      "4127"),
-    ("Slacks Creek",    "4127"),
-    ("Woodridge",       "4114"),
-    ("Logan Central",   "4114"),
-    ("Underwood",       "4119"),
-    ("Rochedale South", "4123"),
-    ("Rochedale",       "4123"),
-    # Browns Plains pocket
-    ("Browns Plains",   "4118"),
-    ("Berrinba",        "4117"),
-    ("Parkinson",       "4115"),
-    # Logan central precinct
-    ("Meadowbrook",     "4131"),
-    ("Kingston",        "4114"),
+    ("Morningside",     "morningside-qld-4170"),
+    ("Murarrie",        "murarrie-qld-4172"),
+    ("Tingalpa",        "tingalpa-qld-4173"),
+    ("Wynnum",          "wynnum-qld-4178"),
+    ("Manly",           "manly-qld-4179"),
+    ("Birkdale",        "birkdale-qld-4159"),
+    ("Wellington Point","wellington-point-qld-4160"),
+    ("Ormiston",        "ormiston-qld-4160"),
+    ("Cleveland",       "cleveland-qld-4163"),
+    ("Alexandra Hills", "alexandra-hills-qld-4161"),
+    ("Capalaba",        "capalaba-qld-4157"),
+    ("Redland Bay",     "redland-bay-qld-4165"),
+    ("Victoria Point",  "victoria-point-qld-4165"),
+    ("Loganholme",      "loganholme-qld-4129"),
+    ("Shailer Park",    "shailer-park-qld-4128"),
+    ("Tanah Merah",     "tanah-merah-qld-4128"),
+    ("Springwood",      "springwood-qld-4127"),
+    ("Daisy Hill",      "daisy-hill-qld-4127"),
+    ("Slacks Creek",    "slacks-creek-qld-4127"),
+    ("Woodridge",       "woodridge-qld-4114"),
+    ("Logan Central",   "logan-central-qld-4114"),
+    ("Underwood",       "underwood-qld-4119"),
+    ("Rochedale South", "rochedale-south-qld-4123"),
+    ("Rochedale",       "rochedale-qld-4123"),
+    ("Browns Plains",   "browns-plains-qld-4118"),
+    ("Berrinba",        "berrinba-qld-4117"),
+    ("Parkinson",       "parkinson-qld-4115"),
+    ("Meadowbrook",     "meadowbrook-qld-4131"),
+    ("Kingston",        "kingston-qld-4114"),
 ]
 
-STATE = "QLD"
+BASE_URL = "https://www.commercialrealestate.com.au/for-lease"
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 LISTINGS_FILE = DATA_DIR / "listings.json"
@@ -76,161 +76,114 @@ def dedupe_key(listing: dict) -> str:
     return f"{listing.get('address','').lower().strip()}|{listing.get('source','')}"
 
 
-# ── commercialrealestate.com.au scraper ───────────────────────────────────────
+# ── Scraper ───────────────────────────────────────────────────────────────────
 
-def scrape_cre(page, suburb: str, postcode: str) -> list:
+def scrape_suburb(page, suburb: str, string_id: str) -> list:
+    """
+    Scrape all lease listings for one suburb from commercialrealestate.com.au.
+
+    URL format: https://www.commercialrealestate.com.au/for-lease/{stringId}/
+    Confirmed selectors (stable data-testid attributes):
+      Cards:   [data-testid^="search-card-"]
+      Address: [data-testid="address"]  (innerText = address, href = link)
+      Price:   [data-testid="price"]
+      Size:    [data-testid="area-size"]
+      Type:    [data-testid="main-category"]
+      Agent:   [data-testid="agent-names"]
+    """
     results = []
-    slug = suburb.lower().replace(" ", "-")
+    url = f"{BASE_URL}/{string_id}/"
+    today = datetime.today().strftime("%Y-%m-%d")
 
-    # Try direct suburb/postcode URL first, then search fallback
-    urls = [
-        f"https://www.commercialrealestate.com.au/lease/{slug}-{STATE.lower()}-{postcode}/",
-        f"https://www.commercialrealestate.com.au/lease/?q={suburb.replace(' ', '+')}+{postcode}+{STATE}&channel=lease",
-        f"https://www.commercialrealestate.com.au/lease/?suburb={suburb.replace(' ', '+')}&state={STATE}",
-    ]
+    try:
+        log.info(f"  → {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(random.randint(2000, 3500))
 
-    for attempt_url in urls:
-        try:
-            log.info(f"  CRE → {attempt_url}")
-            page.goto(attempt_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(random.randint(2500, 4000))
-
-            # Dismiss cookie / consent banners
-            for btn_text in ["Accept", "Accept all", "OK", "Close", "I agree"]:
-                try:
-                    page.click(f"button:has-text('{btn_text}')", timeout=2000)
-                    page.wait_for_timeout(500)
-                    break
-                except Exception:
-                    pass
-
-            # Wait for any listing content to appear
+        # Dismiss any cookie / consent banners
+        for btn_text in ["Accept all", "Accept", "OK", "I agree"]:
             try:
-                page.wait_for_selector(
-                    "[data-testid='listing-card'], "
-                    "div[class*='ListingCard'], "
-                    "div[class*='listing-card'], "
-                    "div[class*='propertyList'] > div, "
-                    "ul[class*='results'] li, "
-                    "article",
-                    timeout=12000
-                )
-            except PWTimeout:
-                log.warning(f"    No listing cards found on {attempt_url}")
-                continue
+                page.click(f"button:has-text('{btn_text}')", timeout=1500)
+                page.wait_for_timeout(300)
+                break
+            except Exception:
+                pass
 
-            # Grab all candidate card elements
-            card_selectors = [
-                "[data-testid='listing-card']",
-                "div[class*='ListingCard']",
-                "div[class*='listing-card']",
-                "article[class*='listing']",
-                "div[class*='property-card']",
-                "div[class*='PropertyCard']",
-            ]
-            cards = []
-            for sel in card_selectors:
-                cards = page.query_selector_all(sel)
-                if cards:
-                    log.info(f"    Selector '{sel}' matched {len(cards)} cards")
-                    break
-
-            if not cards:
-                log.warning(f"    0 cards matched any selector on {attempt_url}")
-                continue
-
-            for card in cards[:50]:
-                try:
-                    listing = _parse_cre_card(card, suburb)
-                    if listing:
-                        results.append(listing)
-                except Exception as e:
-                    log.debug(f"    Card parse error: {e}")
-
-            log.info(f"    Parsed {len(results)} listings for {suburb}")
-
-            if results:
-                break  # Got data — skip remaining URL attempts
-
+        # Wait for listing cards to appear
+        try:
+            page.wait_for_selector('[data-testid^="search-card-"]', timeout=15000)
         except PWTimeout:
-            log.warning(f"    Timeout on {attempt_url}")
-        except Exception as e:
-            log.warning(f"    Error on {attempt_url}: {e}")
+            log.warning(f"    No listing cards found for {suburb}")
+            return []
+
+        # Collect all pages of results
+        page_num = 1
+        while True:
+            cards = page.query_selector_all('[data-testid^="search-card-"]')
+            log.info(f"    Page {page_num}: {len(cards)} cards")
+
+            for card in cards:
+                listing = _parse_card(card, suburb, today)
+                if listing:
+                    results.append(listing)
+
+            # Check for next page
+            try:
+                next_btn = page.query_selector('[data-testid="paginator-navigation-button-next"]:not([disabled])')
+                if next_btn and page_num < 5:  # Cap at 5 pages per suburb
+                    next_btn.click()
+                    page.wait_for_timeout(random.randint(2000, 3000))
+                    page.wait_for_selector('[data-testid^="search-card-"]', timeout=10000)
+                    page_num += 1
+                else:
+                    break
+            except Exception:
+                break
+
+        log.info(f"    Total for {suburb}: {len(results)} listings")
+
+    except PWTimeout:
+        log.warning(f"    Timeout loading {url}")
+    except Exception as e:
+        log.warning(f"    Error scraping {suburb}: {e}")
 
     return results
 
 
-def _parse_cre_card(card, suburb: str) -> dict | None:
-    def txt(*selectors):
-        for sel in selectors:
-            try:
-                el = card.query_selector(sel)
-                if el:
-                    val = el.inner_text().strip()
-                    if val:
-                        return val
-            except Exception:
-                pass
-        return ""
+def _parse_card(card, suburb: str, today: str) -> dict | None:
+    def get(testid):
+        try:
+            el = card.query_selector(f'[data-testid="{testid}"]')
+            return el.inner_text().strip() if el else ""
+        except Exception:
+            return ""
 
-    # Address — try many likely selectors
-    address = txt(
-        "[data-testid='listing-card-address']",
-        "[class*='address']",
-        "[class*='Address']",
-        "h2", "h3", "h4",
-        "[class*='title']",
-        "[class*='Title']",
-    )
+    address = get("address")
     if not address:
         return None
 
-    size = txt(
-        "[class*='area']", "[class*='Area']",
-        "[class*='size']", "[class*='Size']",
-        "[class*='floor']", "[class*='Floor']",
-        "span:has-text('m²')",
-    )
-
-    prop_type = txt(
-        "[class*='type']", "[class*='Type']",
-        "[class*='category']", "[class*='Category']",
-        "[class*='propertyType']",
-    )
-
-    price = txt(
-        "[class*='price']", "[class*='Price']",
-        "[class*='rent']",  "[class*='Rent']",
-        "[data-testid='listing-card-price']",
-    ) or "POA"
-
-    agent = txt(
-        "[class*='agent']",  "[class*='Agent']",
-        "[class*='agency']", "[class*='Agency']",
-        "[class*='contact']",
-    )
-
-    # Link
+    # Link comes from the href on the address element
     link = ""
     try:
-        link_el = card.query_selector("a[href]")
+        link_el = card.query_selector('[data-testid="address"]')
         if link_el:
-            href = link_el.get_attribute("href") or ""
-            link = href if href.startswith("http") else f"https://www.commercialrealestate.com.au{href}"
+            link = link_el.get_attribute("href") or ""
+            if link and not link.startswith("http"):
+                link = f"https://www.commercialrealestate.com.au{link}"
     except Exception:
         pass
 
     return {
-        "address":        address,
-        "suburb":         suburb,
-        "size":           size,
-        "type":           prop_type,
-        "asking_rental":  price,
-        "listing_agent":  agent,
-        "link":           link,
-        "source":         "commercialrealestate.com.au",
-        "first_seen":     datetime.today().strftime("%Y-%m-%d"),
-        "last_updated":   datetime.today().strftime("%Y-%m-%d"),
+        "address":       address,
+        "suburb":        suburb,
+        "size":          get("area-size"),
+        "type":          get("main-category"),
+        "asking_rental": get("price") or "Contact Agent",
+        "listing_agent": get("agent-names"),
+        "link":          link,
+        "source":        "commercialrealestate.com.au",
+        "first_seen":    today,
+        "last_updated":  today,
     }
 
 
@@ -253,9 +206,9 @@ def run_scrape(headless: bool = True) -> dict:
         )
         page = context.new_page()
 
-        for suburb, postcode in SUBURBS:
-            log.info(f"Scraping suburb: {suburb} ({postcode})")
-            found = scrape_cre(page, suburb, postcode)
+        for suburb, string_id in SUBURBS:
+            log.info(f"Scraping: {suburb} ({string_id})")
+            found = scrape_suburb(page, suburb, string_id)
             time.sleep(random.uniform(2.0, 4.0))
 
             for listing in found:
