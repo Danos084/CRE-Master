@@ -1,0 +1,64 @@
+name: Bayside Commercial Listings Agent
+
+on:
+  schedule:
+    # Weekly full scrape – every Monday 6:00 AM AEST (Sunday 8 PM UTC)
+    - cron: "0 20 * * 0"
+    # Daily refresh – every day 7:00 AM AEST (9 PM UTC previous day)
+    - cron: "0 21 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "weekly"
+        type: choice
+        options:
+          - weekly
+          - daily
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright openpyxl python-pptx requests beautifulsoup4 lxml
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Determine run mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "MODE=${{ github.event.inputs.mode }}" >> $GITHUB_ENV
+          elif [ "$(date -u +%u)" = "1" ]; then
+            echo "MODE=weekly" >> $GITHUB_ENV
+          else
+            echo "MODE=daily" >> $GITHUB_ENV
+          fi
+
+      - name: Run agent
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: |
+          python main.py --mode $MODE
+
+      - name: Upload outputs as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: listings-output
+          path: |
+            data/Bayside_Commercial_Listings.xlsx
+            data/Bayside_Commercial_Report.pptx
+            data/listings.json
+          retention-days: 14
