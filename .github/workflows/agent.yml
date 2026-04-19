@@ -2,9 +2,7 @@ name: Bayside Commercial Listings Agent
 
 on:
   schedule:
-    # Weekly full scrape – every Monday 6:00 AM AEST (Sunday 8 PM UTC)
     - cron: "0 20 * * 0"
-    # Daily refresh – every day 7:00 AM AEST (9 PM UTC previous day)
     - cron: "0 21 * * *"
   workflow_dispatch:
     inputs:
@@ -54,6 +52,7 @@ jobs:
           python main.py --mode $MODE
 
       - name: Upload outputs as artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: listings-output
@@ -61,4 +60,6 @@ jobs:
             data/Bayside_Commercial_Listings.xlsx
             data/Bayside_Commercial_Report.pptx
             data/listings.json
+            data/screenshots/
+            agent.log
           retention-days: 14
