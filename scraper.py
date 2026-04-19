@@ -1,9 +1,10 @@
 """
 Bayside Commercial Listings Scraper
-Scrapes commercialrealestate.com.au for lease listings
+Scrapes commercialrealestate.com.au for both lease AND sale listings
 across the Bayside / Logan corridor in Queensland.
 
-URL format confirmed: https://www.commercialrealestate.com.au/for-lease/{stringId}/
+URL format: https://www.commercialrealestate.com.au/for-lease/{stringId}/
+            https://www.commercialrealestate.com.au/for-sale/{stringId}/
 Selectors confirmed via live DOM inspection.
 """
 
@@ -18,8 +19,6 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# Suburbs with confirmed CRE stringIds
-# stringIds sourced from the /bf/api/suggestions endpoint
 SUBURBS = [
     ("Morningside",     "morningside-qld-4170"),
     ("Murarrie",        "murarrie-qld-4172"),
@@ -52,10 +51,14 @@ SUBURBS = [
     ("Kingston",        "kingston-qld-4114"),
 ]
 
-BASE_URL = "https://www.commercialrealestate.com.au/for-lease"
+LISTING_TYPES = [
+    ("for-lease", "Lease"),
+    ("for-sale",  "Sale"),
+]
+
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
-LISTINGS_FILE = DATA_DIR / "listings.json"
+LISTINGS_FILE   = DATA_DIR / "listings.json"
 SCREENSHOTS_DIR = DATA_DIR / "screenshots"
 SCREENSHOTS_DIR.mkdir(exist_ok=True)
 
@@ -73,20 +76,23 @@ def save_listings(data: dict):
 
 
 def dedupe_key(listing: dict) -> str:
-    return f"{listing.get('address','').lower().strip()}|{listing.get('source','')}"
+    return (
+        f"{listing.get('address','').lower().strip()}"
+        f"|{listing.get('listing_type','')}"
+        f"|{listing.get('source','')}"
+    )
 
 
 STEALTH_SCRIPT = """
-// Remove webdriver traces
 Object.defineProperty(navigator, 'webdriver', { get: () => false });
-Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3, 4, 5] });
 Object.defineProperty(navigator, 'languages', { get: () => ['en-AU', 'en-US', 'en'] });
 window.chrome = { runtime: {} };
-const originalQuery = window.navigator.permissions.query;
-window.navigator.permissions.query = (parameters) => (
-    parameters.name === 'notifications' ?
-        Promise.resolve({ state: Notification.permission }) :
-        originalQuery(parameters)
+const _origQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (p) => (
+    p.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : _origQuery(p)
 );
 delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
 delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
@@ -94,18 +100,18 @@ delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
 """
 
 
-def scrape_suburb(page, suburb: str, string_id: str, take_screenshot: bool = False) -> list:
+def scrape_suburb(page, suburb, string_id, url_type, listing_type, take_screenshot=False):
     results = []
-    url = f"{BASE_URL}/{string_id}/"
+    url = f"https://www.commercialrealestate.com.au/{url_type}/{string_id}/"
     today = datetime.today().strftime("%Y-%m-%d")
     try:
-        log.info(f"  -> {url}")
+        log.info(f"  [{listing_type}] -> {url}")
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
         page.wait_for_timeout(random.randint(3000, 5000))
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
-            log.info(f"    networkidle timed out for {suburb}, continuing anyway")
+            log.info(f"    networkidle timed out for {suburb} ({listing_type}), continuing")
         for btn_text in ["Accept all", "Accept", "OK", "I agree", "Got it"]:
             try:
                 page.click(f"button:has-text('{btn_text}')", timeout=2000)
@@ -115,14 +121,13 @@ def scrape_suburb(page, suburb: str, string_id: str, take_screenshot: bool = Fal
                 pass
         if take_screenshot:
             try:
-                screenshot_path = SCREENSHOTS_DIR / f"{string_id}.png"
-                page.screenshot(path=str(screenshot_path), full_page=False)
-                log.info(f"    Screenshot saved: {screenshot_path}")
+                shot_path = SCREENSHOTS_DIR / f"{url_type}-{string_id}.png"
+                page.screenshot(path=str(shot_path), full_page=False)
+                log.info(f"    Screenshot: {shot_path}")
             except Exception as e:
                 log.warning(f"    Screenshot failed: {e}")
         try:
-            title = page.title()
-            log.info(f"    Page title: {title}")
+            log.info(f"    Page title: {page.title()}")
         except Exception:
             pass
         try:
@@ -132,10 +137,9 @@ def scrape_suburb(page, suburb: str, string_id: str, take_screenshot: bool = Fal
                 page.wait_for_selector('[class*="searchCard"]', timeout=5000)
                 log.info(f"    Found cards via class selector fallback")
             except PWTimeout:
-                log.warning(f"    No listing cards found for {suburb} - page may be blocked or empty")
+                log.warning(f"    No cards for {suburb} ({listing_type}) - may be blocked/empty")
                 try:
-                    body_text = page.inner_text("body")[:500]
-                    log.info(f"    Page snippet: {body_text!r}")
+                    log.info(f"    Page snippet: {page.inner_text('body')[:500]!r}")
                 except Exception:
                     pass
                 return []
@@ -144,7 +148,7 @@ def scrape_suburb(page, suburb: str, string_id: str, take_screenshot: bool = Fal
             cards = page.query_selector_all('[data-testid^="search-card-"]')
             log.info(f"    Page {page_num}: {len(cards)} cards")
             for card in cards:
-                listing = _parse_card(card, suburb, today)
+                listing = _parse_card(card, suburb, listing_type, today)
                 if listing:
                     results.append(listing)
             try:
@@ -158,15 +162,15 @@ def scrape_suburb(page, suburb: str, string_id: str, take_screenshot: bool = Fal
                     break
             except Exception:
                 break
-        log.info(f"    Total for {suburb}: {len(results)} listings")
+        log.info(f"    Total for {suburb} ({listing_type}): {len(results)}")
     except PWTimeout:
         log.warning(f"    Timeout loading {url}")
     except Exception as e:
-        log.warning(f"    Error scraping {suburb}: {e}")
+        log.warning(f"    Error scraping {suburb} ({listing_type}): {e}")
     return results
 
 
-def _parse_card(card, suburb: str, today: str) -> dict | None:
+def _parse_card(card, suburb, listing_type, today):
     def get(testid):
         try:
             el = card.query_selector(f'[data-testid="{testid}"]')
@@ -186,20 +190,21 @@ def _parse_card(card, suburb: str, today: str) -> dict | None:
     except Exception:
         pass
     return {
-        "address":       address,
-        "suburb":        suburb,
-        "size":          get("area-size"),
-        "type":          get("main-category"),
-        "asking_rental": get("price") or "Contact Agent",
-        "listing_agent": get("agent-names"),
-        "link":          link,
-        "source":        "commercialrealestate.com.au",
-        "first_seen":    today,
-        "last_updated":  today,
+        "address":         address,
+        "suburb":          suburb,
+        "listing_type":    listing_type,
+        "size":            get("area-size"),
+        "type":            get("main-category"),
+        "price_or_rental": get("price") or "Contact Agent",
+        "listing_agent":   get("agent-names"),
+        "link":            link,
+        "source":          "commercialrealestate.com.au",
+        "first_seen":      today,
+        "last_updated":    today,
     }
 
 
-def run_scrape(headless: bool = True) -> dict:
+def run_scrape(headless=True):
     existing = load_existing()
     today = datetime.today().strftime("%Y-%m-%d")
     new_count = updated_count = 0
@@ -209,13 +214,9 @@ def run_scrape(headless: bool = True) -> dict:
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-accelerated-2d-canvas",
-                "--no-first-run",
-                "--no-zygote",
-                "--disable-gpu",
+                "--no-sandbox", "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage", "--disable-accelerated-2d-canvas",
+                "--no-first-run", "--no-zygote", "--disable-gpu",
             ]
         )
         context = browser.new_context(
@@ -241,30 +242,44 @@ def run_scrape(headless: bool = True) -> dict:
         page = context.new_page()
         try:
             log.info("Visiting homepage to establish session...")
-            page.goto("https://www.commercialrealestate.com.au/", wait_until="domcontentloaded", timeout=30000)
+            page.goto("https://www.commercialrealestate.com.au/",
+                      wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(random.randint(2000, 3500))
             log.info(f"  Homepage title: {page.title()}")
         except Exception as e:
             log.warning(f"  Homepage visit failed: {e}")
-        for i, (suburb, string_id) in enumerate(SUBURBS):
-            log.info(f"Scraping: {suburb} ({string_id})")
-            take_screenshot = (i == 0)
-            found = scrape_suburb(page, suburb, string_id, take_screenshot=take_screenshot)
-            time.sleep(random.uniform(3.0, 6.0))
-            for listing in found:
-                key = dedupe_key(listing)
-                if key not in existing:
-                    existing[key] = listing
-                    new_count += 1
-                else:
-                    existing[key]["last_updated"] = today
-                    for field in ("asking_rental", "listing_agent", "size", "type"):
-                        if listing.get(field):
-                            existing[key][field] = listing[field]
-                    updated_count += 1
+        for url_type, listing_type in LISTING_TYPES:
+            log.info(f"\n{'='*60}")
+            log.info(f"Starting {listing_type.upper()} listings scrape")
+            log.info(f"{'='*60}")
+            first_suburb = True
+            for suburb, string_id in SUBURBS:
+                log.info(f"Scraping [{listing_type}]: {suburb} ({string_id})")
+                found = scrape_suburb(
+                    page, suburb, string_id, url_type, listing_type,
+                    take_screenshot=first_suburb,
+                )
+                first_suburb = False
+                time.sleep(random.uniform(3.0, 6.0))
+                for listing in found:
+                    key = dedupe_key(listing)
+                    if key not in existing:
+                        existing[key] = listing
+                        new_count += 1
+                    else:
+                        existing[key]["last_updated"] = today
+                        for field in ("price_or_rental", "listing_agent", "size", "type"):
+                            if listing.get(field):
+                                existing[key][field] = listing[field]
+                        updated_count += 1
         browser.close()
     save_listings(existing)
-    log.info(f"Done. New: {new_count} | Updated: {updated_count} | Total: {len(existing)}")
+    lease_total = sum(1 for v in existing.values() if v.get("listing_type") == "Lease")
+    sale_total  = sum(1 for v in existing.values() if v.get("listing_type") == "Sale")
+    log.info(
+        f"Done. New: {new_count} | Updated: {updated_count} | "
+        f"Total: {len(existing)} (Lease: {lease_total}, Sale: {sale_total})"
+    )
     return existing
 
 
