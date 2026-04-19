@@ -18,7 +18,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Suburbs with confirmed CRE stringIds ─────────────────────────────────────
+# Suburbs with confirmed CRE stringIds
 # stringIds sourced from the /bf/api/suggestions endpoint
 SUBURBS = [
     ("Morningside",     "morningside-qld-4170"),
@@ -56,9 +56,9 @@ BASE_URL = "https://www.commercialrealestate.com.au/for-lease"
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 LISTINGS_FILE = DATA_DIR / "listings.json"
+SCREENSHOTS_DIR = DATA_DIR / "screenshots"
+SCREENSHOTS_DIR.mkdir(exist_ok=True)
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def load_existing() -> dict:
     if LISTINGS_FILE.exists():
@@ -76,77 +76,93 @@ def dedupe_key(listing: dict) -> str:
     return f"{listing.get('address','').lower().strip()}|{listing.get('source','')}"
 
 
-# ── Scraper ───────────────────────────────────────────────────────────────────
+STEALTH_SCRIPT = """
+// Remove webdriver traces
+Object.defineProperty(navigator, 'webdriver', { get: () => false });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-AU', 'en-US', 'en'] });
+window.chrome = { runtime: {} };
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+);
+delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+"""
 
-def scrape_suburb(page, suburb: str, string_id: str) -> list:
-    """
-    Scrape all lease listings for one suburb from commercialrealestate.com.au.
 
-    URL format: https://www.commercialrealestate.com.au/for-lease/{stringId}/
-    Confirmed selectors (stable data-testid attributes):
-      Cards:   [data-testid^="search-card-"]
-      Address: [data-testid="address"]  (innerText = address, href = link)
-      Price:   [data-testid="price"]
-      Size:    [data-testid="area-size"]
-      Type:    [data-testid="main-category"]
-      Agent:   [data-testid="agent-names"]
-    """
+def scrape_suburb(page, suburb: str, string_id: str, take_screenshot: bool = False) -> list:
     results = []
     url = f"{BASE_URL}/{string_id}/"
     today = datetime.today().strftime("%Y-%m-%d")
-
     try:
-        log.info(f"  → {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(random.randint(2000, 3500))
-
-        # Dismiss any cookie / consent banners
-        for btn_text in ["Accept all", "Accept", "OK", "I agree"]:
+        log.info(f"  -> {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(random.randint(3000, 5000))
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            log.info(f"    networkidle timed out for {suburb}, continuing anyway")
+        for btn_text in ["Accept all", "Accept", "OK", "I agree", "Got it"]:
             try:
-                page.click(f"button:has-text('{btn_text}')", timeout=1500)
-                page.wait_for_timeout(300)
+                page.click(f"button:has-text('{btn_text}')", timeout=2000)
+                page.wait_for_timeout(500)
                 break
             except Exception:
                 pass
-
-        # Wait for listing cards to appear
+        if take_screenshot:
+            try:
+                screenshot_path = SCREENSHOTS_DIR / f"{string_id}.png"
+                page.screenshot(path=str(screenshot_path), full_page=False)
+                log.info(f"    Screenshot saved: {screenshot_path}")
+            except Exception as e:
+                log.warning(f"    Screenshot failed: {e}")
         try:
-            page.wait_for_selector('[data-testid^="search-card-"]', timeout=15000)
+            title = page.title()
+            log.info(f"    Page title: {title}")
+        except Exception:
+            pass
+        try:
+            page.wait_for_selector('[data-testid^="search-card-"]', timeout=20000)
         except PWTimeout:
-            log.warning(f"    No listing cards found for {suburb}")
-            return []
-
-        # Collect all pages of results
+            try:
+                page.wait_for_selector('[class*="searchCard"]', timeout=5000)
+                log.info(f"    Found cards via class selector fallback")
+            except PWTimeout:
+                log.warning(f"    No listing cards found for {suburb} - page may be blocked or empty")
+                try:
+                    body_text = page.inner_text("body")[:500]
+                    log.info(f"    Page snippet: {body_text!r}")
+                except Exception:
+                    pass
+                return []
         page_num = 1
         while True:
             cards = page.query_selector_all('[data-testid^="search-card-"]')
             log.info(f"    Page {page_num}: {len(cards)} cards")
-
             for card in cards:
                 listing = _parse_card(card, suburb, today)
                 if listing:
                     results.append(listing)
-
-            # Check for next page
             try:
                 next_btn = page.query_selector('[data-testid="paginator-navigation-button-next"]:not([disabled])')
-                if next_btn and page_num < 5:  # Cap at 5 pages per suburb
+                if next_btn and page_num < 5:
                     next_btn.click()
-                    page.wait_for_timeout(random.randint(2000, 3000))
-                    page.wait_for_selector('[data-testid^="search-card-"]', timeout=10000)
+                    page.wait_for_timeout(random.randint(2500, 4000))
+                    page.wait_for_selector('[data-testid^="search-card-"]', timeout=15000)
                     page_num += 1
                 else:
                     break
             except Exception:
                 break
-
         log.info(f"    Total for {suburb}: {len(results)} listings")
-
     except PWTimeout:
         log.warning(f"    Timeout loading {url}")
     except Exception as e:
         log.warning(f"    Error scraping {suburb}: {e}")
-
     return results
 
 
@@ -157,12 +173,9 @@ def _parse_card(card, suburb: str, today: str) -> dict | None:
             return el.inner_text().strip() if el else ""
         except Exception:
             return ""
-
     address = get("address")
     if not address:
         return None
-
-    # Link comes from the href on the address element
     link = ""
     try:
         link_el = card.query_selector('[data-testid="address"]')
@@ -172,7 +185,6 @@ def _parse_card(card, suburb: str, today: str) -> dict | None:
                 link = f"https://www.commercialrealestate.com.au{link}"
     except Exception:
         pass
-
     return {
         "address":       address,
         "suburb":        suburb,
@@ -187,15 +199,25 @@ def _parse_card(card, suburb: str, today: str) -> dict | None:
     }
 
 
-# ── Main run ──────────────────────────────────────────────────────────────────
-
 def run_scrape(headless: bool = True) -> dict:
     existing = load_existing()
     today = datetime.today().strftime("%Y-%m-%d")
     new_count = updated_count = 0
-
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
+        browser = pw.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-accelerated-2d-canvas",
+                "--no-first-run",
+                "--no-zygote",
+                "--disable-gpu",
+            ]
+        )
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -203,14 +225,32 @@ def run_scrape(headless: bool = True) -> dict:
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1440, "height": 900},
+            locale="en-AU",
+            timezone_id="Australia/Brisbane",
+            java_script_enabled=True,
+            accept_downloads=False,
+            extra_http_headers={
+                "Accept-Language": "en-AU,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+            }
         )
+        context.add_init_script(STEALTH_SCRIPT)
         page = context.new_page()
-
-        for suburb, string_id in SUBURBS:
+        try:
+            log.info("Visiting homepage to establish session...")
+            page.goto("https://www.commercialrealestate.com.au/", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(random.randint(2000, 3500))
+            log.info(f"  Homepage title: {page.title()}")
+        except Exception as e:
+            log.warning(f"  Homepage visit failed: {e}")
+        for i, (suburb, string_id) in enumerate(SUBURBS):
             log.info(f"Scraping: {suburb} ({string_id})")
-            found = scrape_suburb(page, suburb, string_id)
-            time.sleep(random.uniform(2.0, 4.0))
-
+            take_screenshot = (i == 0)
+            found = scrape_suburb(page, suburb, string_id, take_screenshot=take_screenshot)
+            time.sleep(random.uniform(3.0, 6.0))
             for listing in found:
                 key = dedupe_key(listing)
                 if key not in existing:
@@ -222,9 +262,7 @@ def run_scrape(headless: bool = True) -> dict:
                         if listing.get(field):
                             existing[key][field] = listing[field]
                     updated_count += 1
-
         browser.close()
-
     save_listings(existing)
     log.info(f"Done. New: {new_count} | Updated: {updated_count} | Total: {len(existing)}")
     return existing
